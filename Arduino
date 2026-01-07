@@ -1,0 +1,263 @@
+/*
+   ESP32 WiFi + BLE Scanner
+   Con eliminación de duplicados y cache de cambios
+*/
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+
+#include <vector>
+#include <map>
+#include <time.h>
+
+// ---------------- WiFi Credenciales ----------------
+const char* wifiSSID = "paco";
+const char* wifiPass = "987654321";
+
+// ---------------- Servidor ----------------
+String URL_WIFI = "http://3.148.171.27/scan/save_wifi.php";
+String URL_BLE  = "http://3.148.171.27/scan/save_ble.php";
+
+// ---------------- intervals ----------------
+const unsigned long intervalSend = 2500;
+const unsigned long wifiScanInterval = 6000;
+
+// ---------------- Estructuras ----------------
+struct OutEvent {
+  String json;
+  bool isWifi;
+};
+
+std::vector<OutEvent> eventQueue;
+
+// ---------------- Cache WiFi/BLE ----------------
+struct WifiEntry {
+  int rssi;
+  int channel;
+  String ssid;
+};
+
+std::map<String, WifiEntry> wifiCache;
+
+struct BleEntry {
+  int rssi;
+  String name;
+  String vendor;
+};
+
+std::map<String, BleEntry> bleCache;
+
+// ---------------- VENDOR CACHE ----------------
+struct VendorCache {
+  String mac;
+  String vendor;
+};
+
+std::vector<VendorCache> vendorDB;
+
+bool inVendorCache(const String &mac, String &out) {
+  for (auto &v : vendorDB) {
+    if (v.mac == mac) {
+      out = v.vendor;
+      return true;
+    }
+  }
+  return false;
+}
+
+String urlEncode(const String &str) {
+  String encoded = "";
+  for (int i = 0; i < str.length(); i++) {
+    char c = str.charAt(i);
+    if (isalnum(c)) encoded += c;
+    else {
+      encoded += '%';
+      char code0 = (c >> 4) & 0xF;
+      char code1 = (c & 0xF);
+      encoded += char(code0 > 9 ? code0 + 'A' - 10 : code0 + '0');
+      encoded += char(code1 > 9 ? code1 + 'A' - 10 : code1 + '0');
+    }
+  }
+  return encoded;
+}
+
+String queryVendorAPI(const String &mac) {
+  String vendor;
+
+  if (inVendorCache(mac, vendor)) return vendor;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+
+  String url = "https://api.macvendors.com/" + urlEncode(mac);
+  https.begin(client, url);
+  int code = https.GET();
+
+  if (code == 200) vendor = https.getString();
+  else if (code == 404) vendor = "MAC PRIVADA";
+  else vendor = "API ERROR";
+
+  https.end();
+  vendorDB.push_back({mac, vendor});
+  return vendor;
+}
+
+// ---------------- Utils ----------------
+float calcDistance(int rssi) {
+  const float A = -45.0f;
+  const float n = 2.7f;
+  return pow(10.0f, (A - (float)rssi) / (10.0f * n));
+}
+
+void enqueueEvent(const String &json, bool isWifi) {
+  eventQueue.push_back({json, isWifi});
+}
+
+void sendToServer(const String& json, bool isWifi) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClient client;
+  HTTPClient http;
+
+  http.begin(client, isWifi ? URL_WIFI : URL_BLE);
+  http.addHeader("Content-Type", "application/json");
+
+  int code = http.POST(json);
+  Serial.printf("[SERVER] POST (%s) -> %d\n", isWifi ? "WIFI" : "BLE", code);
+
+  http.end();
+}
+
+// ---------------- SCAN WIFI ----------------
+void scanWiFiNetworks() {
+  Serial.println("[SCAN] Escaneando WiFi...");
+  int n = WiFi.scanNetworks(false, true);
+  Serial.printf("Encontradas %d redes\n", n);
+
+  for (int i = 0; i < n; i++) {
+
+    String bssid = WiFi.BSSIDstr(i);
+    String ssid  = WiFi.SSID(i);
+    int rssi     = WiFi.RSSI(i);
+    int channel  = WiFi.channel(i);
+    float dist   = calcDistance(rssi);
+
+    // ¿YA EXISTE?
+    if (wifiCache.count(bssid)) {
+      WifiEntry prev = wifiCache[bssid];
+
+      // Solo enviar si CAMBIÓ
+      if (prev.rssi == rssi && prev.channel == channel && prev.ssid == ssid) {
+        continue; // No enviar duplicado
+      }
+    }
+
+    // Actualizar cache
+    wifiCache[bssid] = {rssi, channel, ssid};
+
+    // Crear JSON
+    String json = "{";
+    json += "\"type\":\"wifi_network\",";
+    json += "\"ssid\":\"" + ssid + "\",";
+    json += "\"bssid\":\"" + bssid + "\",";
+    json += "\"channel\":" + String(channel) + ",";
+    json += "\"rssi\":" + String(rssi) + ",";
+    json += "\"distance\":" + String(dist) + ",";
+    json += "\"timestamp\":" + String(time(nullptr));
+    json += "}";
+
+    enqueueEvent(json, true);
+  }
+
+  WiFi.scanDelete();
+}
+
+// ---------------- BLE ----------------
+BLEScan* pBLEScan;
+
+class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice device) {
+
+    String mac = device.getAddress().toString().c_str();
+    String name = device.haveName() ? device.getName().c_str() : "Unknown";
+    int rssi = device.getRSSI();
+    float dist = calcDistance(rssi);
+
+    // Vendor
+    String vendor = queryVendorAPI(mac);
+
+    // Evitar duplicados
+    if (bleCache.count(mac)) {
+      BleEntry prev = bleCache[mac];
+      if (prev.rssi == rssi && prev.name == name) return;
+    }
+
+    bleCache[mac] = {rssi, name, vendor};
+
+    String json = "{";
+    json += "\"type\":\"ble\",";
+    json += "\"address\":\"" + mac + "\",";
+    json += "\"name\":\"" + name + "\",";
+    json += "\"vendor\":\"" + vendor + "\",";
+    json += "\"rssi\":" + String(rssi) + ",";
+    json += "\"distance\":" + String(dist) + ",";
+    json += "\"timestamp\":" + String(time(nullptr));
+    json += "}";
+
+
+    enqueueEvent(json, false);
+  }
+};
+
+void initBLE() {
+  BLEDevice::init("");
+  pBLEScan = BLEDevice::getScan();
+  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  pBLEScan->setActiveScan(true);
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(90);
+  pBLEScan->start(5, false);
+}
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(115200);
+
+  WiFi.begin(wifiSSID, wifiPass);
+  Serial.println("Conectando WiFi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi OK!");
+
+  initBLE();
+}
+
+// ---------------- LOOP ----------------
+unsigned long lastSend = 0;
+unsigned long lastWiFiScan = 0;
+
+void loop() {
+
+  if (millis() - lastWiFiScan > wifiScanInterval) {
+    scanWiFiNetworks();
+    lastWiFiScan = millis();
+  }
+
+  if (!eventQueue.empty() && millis() - lastSend > intervalSend) {
+    OutEvent ev = eventQueue.front();
+    eventQueue.erase(eventQueue.begin());
+    sendToServer(ev.json, ev.isWifi);
+    lastSend = millis();
+  }
+
+  delay(10);
+}
