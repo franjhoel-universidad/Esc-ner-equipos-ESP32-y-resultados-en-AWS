@@ -92,11 +92,7 @@ Escaner-Equipos-Electronicos-ESP32-AWS/
 4. Push a tu rama (`git push origin mejora/nueva-feature`).
 5. Abre un Pull Request.
 
-## Licencia
-
-Este proyecto está licenciado bajo la Licencia MIT. Ver el archivo `LICENSE` para más detalles.
-
-## Notas Adicionales
+## Notas sugerencia
 
 - **Seguridad**: Asegúrate de usar HTTPS y autenticación en AWS para proteger los datos.
 - **Costos**: Monitorea los costos de AWS, especialmente en Lambda y DynamoDB para escaneos frecuentes.
